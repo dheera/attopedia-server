@@ -2,8 +2,15 @@ from flask import Flask, abort, Response
 import urllib
 import urllib2
 from bs4 import BeautifulSoup
-import json, re
-from google.appengine.api import urlfetch
+import json, re, os
+import cloudstorage as gcs
+from google.appengine.api import urlfetch, files, app_identity
+
+my_default_retry_params = gcs.RetryParams(initial_delay=0.2,
+                                          max_delay=5.0,
+                                          backoff_factor=2,
+                                          max_retry_period=15)
+gcs.set_default_retry_params(my_default_retry_params)
 
 urlfetch.set_default_fetch_deadline(60)
 
@@ -20,18 +27,40 @@ def wikipage(domain,path):
   if not domain.endswith('.wikipedia.org'):
     abort(404)
 
-  title = path.replace('wiki/', '')
-  title = urllib.unquote(title)
-  title = title.replace('_', ' ')
+  bucket_name = os.environ.get('BUCKET_NAME', app_identity.get_default_gcs_bucket_name())
+  bucket_name = 'attopedia'
+  bucket = '/' + bucket_name
 
-  url = 'http://' + domain + '/' + path + '?action=render'
+  cache_filename = bucket + '/0/' + domain + '/' + path
 
-  result = urlfetch.fetch(url, deadline = 60)
-  if result.status_code == 200:
-    json = wiki_html_to_json_0(result.content, title)
-    return Response(json, mimetype='text/plain')
-  else:
-    abort(404)
+  try:
+    gcs_file = gcs.open(cache_filename, 'r')
+    data = gcs_file.read()
+    return Response(data, mimetype='application/json')
+
+  except Exception,e:
+    print 'File not cached'
+    title = path.replace('wiki/', '')
+    title = urllib.unquote(title)
+    title = title.replace('_', ' ')
+
+    url = 'http://' + domain + '/' + path + '?action=render'
+
+    result = urlfetch.fetch(url, deadline = 60)
+    if result.status_code == 200:
+      json = wiki_html_to_json_0(result.content, title)
+
+      write_retry_params = gcs.RetryParams(backoff_factor=1.1)
+      gcs_file = gcs.open(cache_filename,
+                        'w',
+                        content_type='application/json',
+                        retry_params=write_retry_params)
+
+      gcs_file.write(json)
+      gcs_file.close()
+      return Response(json, mimetype='application/json')
+    else:
+      abort(404)
 
 @app.errorhandler(404)
 def page_not_found(e):
@@ -50,7 +79,8 @@ def wiki_html_to_json_0(html, title = ''):
 
   # image for first slide -- get the first image from the article
   for img in soup.find_all('img'):
-    if int(img.attrs['width']) > 64 or int(img.attrs['height']) > 64:
+    if( ('width' in img.attrs and int(img.attrs['width']) > 64) or 
+        ('height' in img.attrs and int(img.attrs['height']) > 64) ):
       url = img.attrs['src']
       if url.startswith('//'):
         url = 'http:' + url
@@ -69,7 +99,7 @@ def wiki_html_to_json_0(html, title = ''):
         sections.append(current_section)
 
       current_section = { "title": e.string, 'subsections':[] }
-      current_subsection = { "title": e.string, 'contentboxes':[] }
+      current_subsection = { "title": '', 'contentboxes':[] }
 
     # new subsection
     if e.name == 'h3':
@@ -91,7 +121,7 @@ def wiki_html_to_json_0(html, title = ''):
       if(len(imgs)>0):
         url = imgs[0].attrs['src']
         if url.startswith('//'):
-          url = 'http' + url
+          url = 'http:' + url
         if 'image_url' not in current_section:
           current_section['image_url'] = url
         current_subsection['contentboxes'].append( { "type":"image", "url": url } )
